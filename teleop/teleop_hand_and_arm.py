@@ -1,12 +1,16 @@
 import time
 import argparse
+import subprocess
+import socket
 from multiprocessing import Value, Array, Lock
 import threading
 import logging_mp
 logging_mp.basicConfig(level=logging_mp.INFO)
 logger_mp = logging_mp.getLogger(__name__)
 
-import os 
+import math
+import numpy as np
+import os
 import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -14,7 +18,7 @@ sys.path.append(parent_dir)
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize # dds 
 from televuer import TeleVuerWrapper
-from teleop.robot_control.robot_arm import G1_29_ArmController, G1_23_ArmController, H1_2_ArmController, H1_ArmController
+from teleop.robot_control.robot_arm import G1_29_ArmController, G1_23_ArmController, H1_2_ArmController, H1_ArmController, G1_29_JointArmIndex, G1_29_JointIndex
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK
 from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
@@ -30,9 +34,15 @@ def publish_reset_category(category: int, publisher): # Scene Reset signal
     publisher.Write(msg)
     logger_mp.info(f"published reset category: {category}")
 
+def extract_yaw_from_pose(pose_4x4: np.ndarray) -> float:
+    """Extract yaw angle (z-up convention) from a 4x4 pose matrix."""
+    return float(np.arctan2(pose_4x4[1, 0], pose_4x4[0, 0]))
+
 # state transition
 START          = False  # Enable to start robot following VR user motion
 STOP           = False  # Enable to begin system exit procedure
+SOFT_ESTOP     = False  # Enable to enter damping mode (soft emergency stop)
+arm_ctrl_ref   = None   # global reference for E-stop direct access
 READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNING state
 RECORD_RUNNING = False  # True if [Recording]
 RECORD_TOGGLE  = False  # Toggle recording state
@@ -49,12 +59,25 @@ RECORD_TOGGLE  = False  # Toggle recording state
 #  --> auto  : Auto-transition after saving data.
 
 def on_press(key):
-    global STOP, START, RECORD_TOGGLE
+    global STOP, START, RECORD_TOGGLE, SOFT_ESTOP, arm_ctrl_ref
     if key == 'r':
         START = True
-    elif key == 'q':
+    elif key in ('q', 'space'):
         START = False
         STOP = True
+    elif key in ('up', 'down', 'left', 'right'):
+        SOFT_ESTOP = True
+        START = False
+        # immediately set kp/kd to 0 so arms go limp
+        if arm_ctrl_ref is not None:
+            for id in G1_29_JointArmIndex:
+                arm_ctrl_ref.msg.motor_cmd[id].kp = 0.0
+                arm_ctrl_ref.msg.motor_cmd[id].kd = 0.0
+                arm_ctrl_ref.msg.motor_cmd[id].tau = 0.0
+            # waist also goes limp
+            arm_ctrl_ref.msg.motor_cmd[G1_29_JointIndex.kWaistYaw].kp = 0.0
+            arm_ctrl_ref.msg.motor_cmd[G1_29_JointIndex.kWaistYaw].kd = 0.0
+        logger_mp.info(f"🛑  [SOFT E-STOP] '{key}' pressed! Arms entering damping mode...")
     elif key == 's' and START == True:
         RECORD_TOGGLE = True
     else:
@@ -78,14 +101,17 @@ if __name__ == '__main__':
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1'], default='G1_29', help='Select arm controller')
     parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'brainco'], help='Select end effector controller')
-    parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server, used by teleimager and televuer')
+    parser.add_argument('--img-server-ip', type=str, default='10.86.160.1', help='IP address of image server, used by teleimager and televuer')
     parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
     # mode flags
     parser.add_argument('--motion', action = 'store_true', help = 'Enable motion control mode')
     parser.add_argument('--headless', action='store_true', help='Enable headless mode (no display)')
     parser.add_argument('--sim', action = 'store_true', help = 'Enable isaac simulation mode')
+    parser.add_argument('--wrist-view', action = 'store_true', help = 'Enable wrist camera view in VR (auto-enabled in --sim mode)')
     parser.add_argument('--ipc', action = 'store_true', help = 'Enable IPC server to handle input; otherwise enable sshkeyboard')
     parser.add_argument('--affinity', action = 'store_true', help = 'Enable high priority and set CPU affinity mode')
+    parser.add_argument('--debug', action = 'store_true', help = 'Enable debug mode (show red square HUD for VR rendering verification)')
+    parser.add_argument('--relay-port', type=int, default=8080, help='WebRTC relay server port for image streaming to XR')
     # record mode and task info
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
     parser.add_argument('--task-dir', type = str, default = './utils/data/', help = 'path to save data')
@@ -93,8 +119,17 @@ if __name__ == '__main__':
     parser.add_argument('--task-goal', type = str, default = 'pick up cube.', help = 'task goal for recording at json file')
     parser.add_argument('--task-desc', type = str, default = 'task description', help = 'task description for recording at json file')
     parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
+    # waist yaw follow options (experimental, opt-in)
+    parser.add_argument('--waist-follow', action='store_true', help='Enable waist yaw following head rotation')
+    parser.add_argument('--waist-gain', type=float, default=1.0, help='Head yaw to waist yaw scale factor')
+    parser.add_argument('--waist-max-deg', type=float, default=35.0, help='Max waist rotation in degrees')
+    parser.add_argument('--waist-smoothing', type=float, default=0.15, help='Low-pass filter factor (0~1, lower=smoother)')
+    parser.add_argument('--waist-deadband-deg', type=float, default=3.0, help='Deadband threshold in degrees')
 
     args = parser.parse_args()
+    if args.sim and not args.wrist_view:
+        args.wrist_view = True
+        logger_mp.info("Auto-enabling --wrist-view in --sim mode.")
     logger_mp.info(f"args: {args}")
 
     try:
@@ -119,19 +154,49 @@ if __name__ == '__main__':
         img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
         camera_config = img_client.get_cam_config()
         logger_mp.debug(f"Camera config: {camera_config}")
-        xr_need_local_img = not (args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
+        xr_need_local_img = args.display_mode != 'pass-through'
+
+        # Launch WebRTC relay for streaming images to XR (replaces ZMQ → JPEG compression path)
+        relay_process = None
+        use_webrtc_relay = xr_need_local_img and not args.headless
+        if use_webrtc_relay:
+            def _get_local_ip():
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    s.connect(('8.8.8.8', 80))
+                    ip = s.getsockname()[0]
+                    s.close()
+                    return ip
+                except Exception:
+                    return '0.0.0.0'
+
+            relay_cmd = [
+                sys.executable, '-m', 'teleimager.webrtc_relay',
+                '--host', args.img_server_ip,
+                '--port', str(args.relay_port),
+            ]
+            relay_process = subprocess.Popen(relay_cmd)
+            local_ip = _get_local_ip()
+            relay_base_url = f"https://{local_ip}:{args.relay_port}"
+            webrtc_url = f"{relay_base_url}/offer"
+            wrist_webrtc_urls = {
+                'left': f"{relay_base_url}/offer/left_wrist",
+                'right': f"{relay_base_url}/offer/right_wrist",
+            }
+            time.sleep(2)  # Wait for relay server to start
+            logger_mp.info(f"WebRTC relay started (PID: {relay_process.pid}, URL: {relay_base_url})")
 
         # televuer_wrapper: obtain hand pose data from the XR device and transmit the robot's head camera image to the XR device.
-        tv_wrapper = TeleVuerWrapper(use_hand_tracking=args.input_mode == "hand", 
+        tv_wrapper = TeleVuerWrapper(use_hand_tracking=args.input_mode == "hand",
                                      binocular=camera_config['head_camera']['binocular'],
                                      img_shape=camera_config['head_camera']['image_shape'],
-                                     # maybe should decrease fps for better performance?
-                                     # https://github.com/unitreerobotics/xr_teleoperate/issues/172
-                                     # display_fps=camera_config['head_camera']['fps'] ? args.frequency? 30.0?
                                      display_mode=args.display_mode,
-                                     zmq=camera_config['head_camera']['enable_zmq'],
-                                     webrtc=camera_config['head_camera']['enable_webrtc'],
-                                     webrtc_url=f"https://{args.img_server_ip}:{camera_config['head_camera']['webrtc_port']}/offer",
+                                     zmq=not use_webrtc_relay and xr_need_local_img,
+                                     webrtc=use_webrtc_relay,
+                                     webrtc_url=webrtc_url if use_webrtc_relay else None,
+                                     wrist_view=args.wrist_view,
+                                     wrist_webrtc_urls=wrist_webrtc_urls if use_webrtc_relay and args.wrist_view else None,
+                                     debug=args.debug,
                                      )
         
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
@@ -156,6 +221,8 @@ if __name__ == '__main__':
         elif args.arm == "H1":
             arm_ik = H1_ArmIK()
             arm_ctrl = H1_ArmController(simulation_mode=args.sim)
+
+        arm_ctrl_ref = arm_ctrl  # set global reference for E-stop
 
         # end-effector
         if args.ee == "dex3":
@@ -245,32 +312,96 @@ if __name__ == '__main__':
             logger_mp.info("🟡  Press [s] to START or SAVE recording (toggle cycle).")
         else:
             logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
+        logger_mp.info("🛑  Press [arrow keys] for soft E-stop (damping mode).")
         logger_mp.info("🔴  Press [q] to stop and exit the program.")
         logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
         READY = True                  # now ready to (1) enter START state
         while not START and not STOP: # wait for start or stop signal.
+            if SOFT_ESTOP:
+                logger_mp.info("🛑  Arms are in damping mode. Press [r] to start or [q] to quit.")
+                SOFT_ESTOP = False
             time.sleep(0.033)
-            if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
-                head_img = img_client.get_head_frame()
-                tv_wrapper.render_to_xr(head_img)
+            if not use_webrtc_relay:
+                # ZMQ fallback (headless or pass-through): manually push images to vuer
+                if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
+                    head_img = img_client.get_head_frame()
+                    tv_wrapper.render_to_xr(head_img)
+                if args.wrist_view and xr_need_local_img:
+                    left_wrist_img_pre = img_client.get_left_wrist_frame() if camera_config['left_wrist_camera']['enable_zmq'] else None
+                    right_wrist_img_pre = img_client.get_right_wrist_frame() if camera_config['right_wrist_camera']['enable_zmq'] else None
+                    tv_wrapper.render_wrist_to_xr(left_wrist_img_pre, right_wrist_img_pre)
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
         arm_ctrl.speed_gradual_max()
+
+        # waist yaw follow initialization
+        if args.waist_follow:
+            waist_yaw_index = G1_29_JointIndex.kWaistYaw  # index 12
+            waist_limit = math.radians(args.waist_max_deg)
+            waist_deadband = math.radians(args.waist_deadband_deg)
+            waist_base_q = arm_ctrl.all_motor_q[waist_yaw_index]
+            waist_cmd_q = waist_base_q
+            waist_head_yaw_ref = None  # set on first frame
+            logger_mp.info(f"🔄  Waist follow enabled (gain={args.waist_gain}, max={args.waist_max_deg}°, "
+                           f"smoothing={args.waist_smoothing}, deadband={args.waist_deadband_deg}°)")
+
+        left_wrist_img = None
+        right_wrist_img = None
         # main loop. robot start to follow VR user's motion
         while not STOP:
+            # soft E-stop: set arm kp/kd to 0 so motors go limp
+            if SOFT_ESTOP:
+                try:
+                    for id in G1_29_JointArmIndex:
+                        arm_ctrl.msg.motor_cmd[id].kp = 0.0
+                        arm_ctrl.msg.motor_cmd[id].kd = 0.0
+                        arm_ctrl.msg.motor_cmd[id].tau = 0.0
+                    if args.waist_follow:
+                        arm_ctrl.msg.motor_cmd[G1_29_JointIndex.kWaistYaw].kp = 0.0
+                        arm_ctrl.msg.motor_cmd[G1_29_JointIndex.kWaistYaw].kd = 0.0
+                except Exception as e:
+                    logger_mp.error(f"Failed to enter damping mode: {e}")
+                logger_mp.info("🛑  Arms are in damping mode. Press [r] to restart or [q] to quit.")
+                SOFT_ESTOP = False
+                START = False
+                while not START and not STOP:
+                    time.sleep(0.1)
+                if START:
+                    # restore kp/kd
+                    for id in G1_29_JointArmIndex:
+                        if arm_ctrl._Is_wrist_motor(id):
+                            arm_ctrl.msg.motor_cmd[id].kp = arm_ctrl.kp_wrist
+                            arm_ctrl.msg.motor_cmd[id].kd = arm_ctrl.kd_wrist
+                        else:
+                            arm_ctrl.msg.motor_cmd[id].kp = arm_ctrl.kp_low
+                            arm_ctrl.msg.motor_cmd[id].kd = arm_ctrl.kd_low
+                    if args.waist_follow:
+                        arm_ctrl.msg.motor_cmd[G1_29_JointIndex.kWaistYaw].kp = arm_ctrl.kp_high
+                        arm_ctrl.msg.motor_cmd[G1_29_JointIndex.kWaistYaw].kd = arm_ctrl.kd_high
+                        waist_base_q = arm_ctrl.all_motor_q[waist_yaw_index]
+                        waist_cmd_q = waist_base_q
+                        waist_head_yaw_ref = None
+                    arm_ctrl.speed_gradual_max()
+                    logger_mp.info("---------------------🚀 Resumed Tracking 🚀-------------------------")
+                continue
             start_time = time.time()
-            # get image
-            if camera_config['head_camera']['enable_zmq']:
-                if args.record or xr_need_local_img:
-                    head_img = img_client.get_head_frame()
-                if xr_need_local_img:
+            # get image (WebRTC relay handles XR display; only fetch here for recording or ZMQ fallback)
+            need_img_fetch = args.record or (not use_webrtc_relay and xr_need_local_img)
+            if camera_config['head_camera']['enable_zmq'] and need_img_fetch:
+                head_img = img_client.get_head_frame()
+                if not use_webrtc_relay and xr_need_local_img:
                     tv_wrapper.render_to_xr(head_img)
             if camera_config['left_wrist_camera']['enable_zmq']:
-                if args.record:
+                if args.record or (not use_webrtc_relay and args.wrist_view):
                     left_wrist_img = img_client.get_left_wrist_frame()
             if camera_config['right_wrist_camera']['enable_zmq']:
-                if args.record:
+                if args.record or (not use_webrtc_relay and args.wrist_view):
                     right_wrist_img = img_client.get_right_wrist_frame()
+            if not use_webrtc_relay and args.wrist_view and xr_need_local_img:
+                tv_wrapper.render_wrist_to_xr(
+                    left_wrist_img if camera_config['left_wrist_camera']['enable_zmq'] else None,
+                    right_wrist_img if camera_config['right_wrist_camera']['enable_zmq'] else None,
+                )
 
             # record mode
             if args.record and RECORD_TOGGLE:
@@ -319,6 +450,35 @@ if __name__ == '__main__':
                 loco_wrapper.Move(-tele_data.left_ctrl_thumbstickValue[1] * 0.3,
                                   -tele_data.left_ctrl_thumbstickValue[0] * 0.3,
                                   -tele_data.right_ctrl_thumbstickValue[0]* 0.3)
+
+            # waist yaw follow (only when --waist-follow is enabled)
+            if args.waist_follow:
+                head_yaw = extract_yaw_from_pose(tele_data.head_pose)
+                if waist_head_yaw_ref is None:
+                    waist_head_yaw_ref = head_yaw
+
+                # yaw delta relative to reference (with wraparound handling)
+                yaw_delta = np.arctan2(np.sin(head_yaw - waist_head_yaw_ref),
+                                       np.cos(head_yaw - waist_head_yaw_ref))
+
+                # gain + clamp
+                waist_offset = np.clip(args.waist_gain * yaw_delta, -waist_limit, waist_limit)
+
+                # deadband
+                if abs(waist_offset) < waist_deadband:
+                    waist_offset = 0.0
+
+                # target = base position + offset
+                waist_target_q = waist_base_q + waist_offset
+
+                # low-pass filter (EMA)
+                waist_cmd_q = (1.0 - args.waist_smoothing) * waist_cmd_q + args.waist_smoothing * waist_target_q
+
+                # write directly to motor_cmd (thread-safe)
+                with arm_ctrl.ctrl_lock:
+                    arm_ctrl.msg.motor_cmd[waist_yaw_index].q = waist_cmd_q
+                    arm_ctrl.msg.motor_cmd[waist_yaw_index].dq = 0.0
+                    arm_ctrl.msg.motor_cmd[waist_yaw_index].tau = 0.0
 
             # get current robot state data.
             current_lr_arm_q  = arm_ctrl.get_current_dual_arm_q()
@@ -392,27 +552,27 @@ if __name__ == '__main__':
                         else:
                             logger_mp.warning("Head image is None!")
                         if camera_config['left_wrist_camera']['enable_zmq']:
-                            if left_wrist_img is not None:
+                            if left_wrist_img is not None and left_wrist_img.bgr is not None:
                                 colors[f"color_{2}"] = left_wrist_img.bgr
                             else:
                                 logger_mp.warning("Left wrist image is None!")
                         if camera_config['right_wrist_camera']['enable_zmq']:
-                            if right_wrist_img is not None:
+                            if right_wrist_img is not None and right_wrist_img.bgr is not None:
                                 colors[f"color_{3}"] = right_wrist_img.bgr
                             else:
                                 logger_mp.warning("Right wrist image is None!")
                     else:
                         if head_img is not None:
-                            colors[f"color_{0}"] = head_img
+                            colors[f"color_{0}"] = head_img.bgr
                         else:
                             logger_mp.warning("Head image is None!")
                         if camera_config['left_wrist_camera']['enable_zmq']:
-                            if left_wrist_img is not None:
+                            if left_wrist_img is not None and left_wrist_img.bgr is not None:
                                 colors[f"color_{1}"] = left_wrist_img.bgr
                             else:
                                 logger_mp.warning("Left wrist image is None!")
                         if camera_config['right_wrist_camera']['enable_zmq']:
-                            if right_wrist_img is not None:
+                            if right_wrist_img is not None and right_wrist_img.bgr is not None:
                                 colors[f"color_{2}"] = right_wrist_img.bgr
                             else:
                                 logger_mp.warning("Right wrist image is None!")
@@ -507,6 +667,16 @@ if __name__ == '__main__':
             tv_wrapper.close()
         except Exception as e:
             logger_mp.error(f"Failed to close televuer wrapper: {e}")
+
+        try:
+            if relay_process is not None:
+                relay_process.terminate()
+                relay_process.wait(timeout=3)
+                logger_mp.info("WebRTC relay process terminated.")
+        except Exception as e:
+            logger_mp.error(f"Failed to stop WebRTC relay: {e}")
+            if relay_process is not None:
+                relay_process.kill()
 
         try:
             if not args.motion:
