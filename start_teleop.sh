@@ -1,6 +1,5 @@
 #!/bin/bash
 # G1 EDU + Quest 3 Teleoperation Startup Script
-# Usage: bash start_teleop.sh [--sim]
 
 set -e
 
@@ -8,28 +7,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TELEOP_DIR="$SCRIPT_DIR/teleop"
 
 # Activate conda environment
-source "$HOME/miniconda3/etc/profile.d/conda.sh"
-conda activate tv
-
-# Check network connectivity to G1 robot (skip in sim mode)
-if [[ "$1" != "--sim" ]]; then
-    echo "Checking G1 robot network (192.168.123.x)..."
-    if ping -c 1 -W 2 192.168.123.161 > /dev/null 2>&1; then
-        echo "G1 robot reachable at 192.168.123.161"
-    else
-        echo "WARNING: Cannot reach G1 robot at 192.168.123.161"
-        echo "Make sure ethernet is connected and IP is configured (192.168.123.2)"
-        read -p "Continue anyway? [y/N] " -n 1 -r
-        echo
-        [[ $REPLY =~ ^[Yy]$ ]] || exit 1
-    fi
-fi
-
-# Check SSL certificates
-if [[ ! -f "$HOME/.config/xr_teleoperate/cert.pem" ]]; then
-    echo "ERROR: SSL certificate not found at ~/.config/xr_teleoperate/cert.pem"
+if [[ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]]; then
+    source "$HOME/miniconda3/etc/profile.d/conda.sh"
+elif [[ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]]; then
+    source "$HOME/anaconda3/etc/profile.d/conda.sh"
+else
+    echo "ERROR: conda not found in miniconda3 or anaconda3"
     exit 1
 fi
+conda activate tv
 
 # Mode selection
 echo "========================================"
@@ -40,12 +26,14 @@ echo "  1) Waist follow + Pass-through"
 echo "  2) Waist follow + Ego (waist-max-deg=180)"
 echo "  3) Upper body only + Ego (no motion)"
 echo "  4) Waist follow + Ego (custom waist-max-deg)"
+echo "  5) Simulation + Ego (waist-max-deg=180)"
 echo ""
-read -p "Select mode [1-4]: " MODE_SELECT
+read -p "Select mode [1-5]: " MODE_SELECT
 
 DISPLAY_MODE=""
 WAIST_OPTS=""
 MOTION_OPT="--motion"
+SIM_OPT=""
 
 case $MODE_SELECT in
     1)
@@ -67,11 +55,37 @@ case $MODE_SELECT in
         WAIST_DEG=${WAIST_DEG:-35}
         WAIST_OPTS="--waist-follow --waist-max-deg $WAIST_DEG"
         ;;
+    5)
+        DISPLAY_MODE="ego"
+        WAIST_OPTS="--waist-follow --waist-max-deg 180"
+        MOTION_OPT=""
+        SIM_OPT="--sim"
+        ;;
     *)
         echo "Invalid selection. Exiting."
         exit 1
         ;;
 esac
+
+# Check network connectivity to G1 robot (skip in sim mode)
+if [[ -z "$SIM_OPT" ]]; then
+    echo "Checking G1 robot network (192.168.123.x)..."
+    if ping -c 1 -W 2 192.168.123.161 > /dev/null 2>&1; then
+        echo "G1 robot reachable at 192.168.123.161"
+    else
+        echo "WARNING: Cannot reach G1 robot at 192.168.123.161"
+        echo "Make sure ethernet is connected and IP is configured (192.168.123.2)"
+        read -p "Continue anyway? [y/N] " -n 1 -r
+        echo
+        [[ $REPLY =~ ^[Yy]$ ]] || exit 1
+    fi
+fi
+
+# Check SSL certificates
+if [[ ! -f "$HOME/.config/xr_teleoperate/cert.pem" ]]; then
+    echo "ERROR: SSL certificate not found at ~/.config/xr_teleoperate/cert.pem"
+    exit 1
+fi
 
 echo ""
 echo "Controls:"
@@ -86,9 +100,10 @@ cd "$TELEOP_DIR"
 RECORD_DIR="/data/G1"
 python teleop_hand_and_arm.py --arm=G1_29 --ee=dex3 \
     --display-mode $DISPLAY_MODE --input-mode hand \
-    $MOTION_OPT $WAIST_OPTS --waist-gain 1.0\
+    $MOTION_OPT $WAIST_OPTS --waist-gain 1.0 \
+    $SIM_OPT \
     --record --task-dir "$RECORD_DIR" --task-name "teleop" \
-    "$@" --img-server-ip 192.168.123.164
+    "$@"
 
 # --display-mode 옵션:
 #   immersive    : Quest 3에 로봇 카메라 영상을 송출 (기본값)
