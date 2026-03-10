@@ -501,8 +501,8 @@ if __name__ == '__main__':
                         right_ee_state = dual_hand_state_array[-7:]
                         left_hand_action = dual_hand_action_array[:7]
                         right_hand_action = dual_hand_action_array[-7:]
-                        current_body_state = []
-                        current_body_action = []
+                        current_body_state = arm_ctrl.get_current_motor_q().tolist()
+                        current_body_action = arm_ctrl.get_current_motor_q().tolist()
                 elif args.ee == "dex1" and args.input_mode == "hand":
                     with dual_gripper_data_lock:
                         left_ee_state = [dual_gripper_state_array[0]]
