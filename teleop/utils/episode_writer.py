@@ -54,7 +54,8 @@ class EpisodeWriter():
         # Initialize the queue and worker thread
         self.item_data_queue = Queue(-1)
         self.stop_worker = False
-        self.need_save = False  # Flag to indicate when save_episode is triggered
+        self.need_save = False     # Flag to indicate when save_episode is triggered
+        self.need_discard = False  # Flag to indicate when discard_episode is triggered
         self.worker_thread = Thread(target=self.process_queue)
         self.worker_thread.start()
 
@@ -156,6 +157,10 @@ class EpisodeWriter():
             except Empty:
                 pass
         
+            # Check if discard_episode was triggered
+            if self.need_discard and self.item_data_queue.empty():
+                self._discard_episode()
+
             # Check if save_episode was triggered
             if self.need_save and self.item_data_queue.empty():
                 self._save_episode()
@@ -219,6 +224,29 @@ class EpisodeWriter():
         self.need_save = False     # Reset the save flag
         self.is_available = True   # Mark the class as available after saving
         logger_mp.info(f"==> Episode saved successfully to {self.json_path}.")
+
+    def discard_episode(self):
+        """
+        Trigger the discard operation. Drains the queue and deletes the episode directory.
+        """
+        self.need_discard = True
+        logger_mp.info(f"==> Episode discard start...")
+
+    def _discard_episode(self):
+        """
+        Discard the current episode by removing the episode directory.
+        """
+        import shutil
+        try:
+            if hasattr(self, 'episode_dir') and os.path.exists(self.episode_dir):
+                shutil.rmtree(self.episode_dir)
+                logger_mp.info(f"==> Episode discarded: {self.episode_dir}")
+        except Exception as e:
+            logger_mp.error(f"==> Failed to discard episode: {e}")
+
+        self.episode_id -= 1  # Reuse the same episode_id for next recording
+        self.need_discard = False
+        self.is_available = True
 
     def close(self):
         """
