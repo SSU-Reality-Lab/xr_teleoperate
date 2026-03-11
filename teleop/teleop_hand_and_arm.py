@@ -25,6 +25,7 @@ from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
 from sshkeyboard import listen_keyboard, stop_listening
+from teleop.utils.scene_client import SceneClient
 
 # for simulation
 from unitree_sdk2py.core.channel import ChannelPublisher
@@ -128,6 +129,8 @@ if __name__ == '__main__':
     parser.add_argument('--waist-max-deg', type=float, default=35.0, help='Max waist rotation in degrees')
     parser.add_argument('--waist-smoothing', type=float, default=0.15, help='Low-pass filter factor (0~1, lower=smoother)')
     parser.add_argument('--waist-deadband-deg', type=float, default=3.0, help='Deadband threshold in degrees')
+    parser.add_argument('--scene-api-url', type=str, default='http://localhost:8200',
+                        help='URL of the Scene Control API server (unitree_sim_isaaclab)')
 
     args = parser.parse_args()
     if args.sim and not args.wrist_view:
@@ -301,6 +304,17 @@ if __name__ == '__main__':
             from teleop.utils.sim_state_topic import start_sim_state_subscribe
             sim_state_subscriber = start_sim_state_subscribe()
 
+        # Scene API client (for CS-Projects remote scene control)
+        scene_client = None
+        if args.sim and args.record:
+            scene_client = SceneClient(server_url=args.scene_api_url)
+            if scene_client.is_available():
+                status = scene_client.get_status()
+                logger_mp.info(f"[Scene API] Connected. Scene {status.current_scene_index}/{status.total_scenes - 1}")
+            else:
+                logger_mp.warning("[Scene API] Server not available — falling back to DDS reset only")
+                scene_client = None
+
         # record + headless / non-headless mode
         if args.record:
             recorder = EpisodeWriter(task_dir = os.path.join(args.task_dir, args.task_name),
@@ -413,8 +427,18 @@ if __name__ == '__main__':
                 RECORD_DISCARD = False
                 RECORD_RUNNING = False
                 recorder.discard_episode()
-                logger_mp.info("🗑️  Episode discarded. Press [s] to start a new recording.")
-                if args.sim:
+                logger_mp.info("🗑️  Episode discarded.")
+
+                if scene_client is not None:
+                    result = scene_client.reset_scene()
+                    if result.success:
+                        logger_mp.info(f"[Scene API] Scene reset OK (task {result.task_num}, scene {result.current_scene_index}). "
+                                       "Press [s] to retry recording.")
+                    else:
+                        logger_mp.error(f"[Scene API] Reset failed: {result.message}")
+                        if args.sim:
+                            publish_reset_category(1, reset_pose_publisher)
+                elif args.sim:
                     publish_reset_category(1, reset_pose_publisher)
 
             # record mode: toggle (start / save)
@@ -428,7 +452,23 @@ if __name__ == '__main__':
                 else:
                     RECORD_RUNNING = False
                     recorder.save_episode()
-                    if args.sim:
+
+                    if scene_client is not None:
+                        result = scene_client.next_scene()
+                        if result.all_completed:
+                            logger_mp.info("══════════════════════════════════════")
+                            logger_mp.info("  ✅ ALL TASKS COMPLETED!")
+                            logger_mp.info("══════════════════════════════════════")
+                            START = False
+                            STOP = True
+                        elif result.success:
+                            logger_mp.info(f"[Scene API] Next scene loaded (task {result.task_num}, scene {result.current_scene_index}). "
+                                           "Press [s] to start recording.")
+                        else:
+                            logger_mp.error(f"[Scene API] Load next failed: {result.message}")
+                            if args.sim:
+                                publish_reset_category(1, reset_pose_publisher)
+                    elif args.sim:
                         publish_reset_category(1, reset_pose_publisher)
 
             # get xr's tele data
@@ -706,6 +746,12 @@ if __name__ == '__main__':
         except Exception as e:
             logger_mp.error(f"Failed to stop sim state subscriber: {e}")
         
+        try:
+            if scene_client is not None:
+                scene_client.close()
+        except Exception as e:
+            logger_mp.error(f"Failed to close scene client: {e}")
+
         try:
             if args.record:
                 recorder.close()
