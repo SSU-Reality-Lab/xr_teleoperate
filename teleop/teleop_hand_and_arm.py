@@ -46,6 +46,7 @@ arm_ctrl_ref   = None   # global reference for E-stop direct access
 READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNING state
 RECORD_RUNNING = False  # True if [Recording]
 RECORD_TOGGLE  = False  # Toggle recording state
+RECORD_DISCARD = False  # Discard current recording
 #  -------        ---------                -----------                -----------            ---------
 #   state          [Ready]      ==>        [Recording]     ==>         [AutoSave]     -->     [Ready]
 #  -------        ---------      |         -----------      |         -----------      |     ---------
@@ -59,7 +60,7 @@ RECORD_TOGGLE  = False  # Toggle recording state
 #  --> auto  : Auto-transition after saving data.
 
 def on_press(key):
-    global STOP, START, RECORD_TOGGLE, SOFT_ESTOP, arm_ctrl_ref
+    global STOP, START, RECORD_TOGGLE, RECORD_DISCARD, SOFT_ESTOP, arm_ctrl_ref
     if key == 'r':
         START = True
     elif key in ('q', 'space'):
@@ -80,6 +81,8 @@ def on_press(key):
         logger_mp.info(f"🛑  [SOFT E-STOP] '{key}' pressed! Arms entering damping mode...")
     elif key == 's' and START == True:
         RECORD_TOGGLE = True
+    elif key == 'd' and START == True and RECORD_RUNNING == True:
+        RECORD_DISCARD = True
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
 
@@ -197,6 +200,7 @@ if __name__ == '__main__':
                                      wrist_view=args.wrist_view,
                                      wrist_webrtc_urls=wrist_webrtc_urls if use_webrtc_relay and args.wrist_view else None,
                                      debug=args.debug,
+                                     waist_follow=args.waist_follow,
                                      )
         
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
@@ -310,6 +314,7 @@ if __name__ == '__main__':
         logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
         if args.record:
             logger_mp.info("🟡  Press [s] to START or SAVE recording (toggle cycle).")
+            logger_mp.info("🗑️   Press [d] to DISCARD current recording (during recording).")
         else:
             logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
         logger_mp.info("🛑  Press [arrow keys] for soft E-stop (damping mode).")
@@ -403,7 +408,16 @@ if __name__ == '__main__':
                     right_wrist_img if camera_config['right_wrist_camera']['enable_zmq'] else None,
                 )
 
-            # record mode
+            # record mode: discard
+            if args.record and RECORD_DISCARD:
+                RECORD_DISCARD = False
+                RECORD_RUNNING = False
+                recorder.discard_episode()
+                logger_mp.info("🗑️  Episode discarded. Press [s] to start a new recording.")
+                if args.sim:
+                    publish_reset_category(1, reset_pose_publisher)
+
+            # record mode: toggle (start / save)
             if args.record and RECORD_TOGGLE:
                 RECORD_TOGGLE = False
                 if not RECORD_RUNNING:
@@ -501,8 +515,8 @@ if __name__ == '__main__':
                         right_ee_state = dual_hand_state_array[-7:]
                         left_hand_action = dual_hand_action_array[:7]
                         right_hand_action = dual_hand_action_array[-7:]
-                        current_body_state = []
-                        current_body_action = []
+                        current_body_state = arm_ctrl.get_current_motor_q().tolist()
+                        current_body_action = arm_ctrl.get_current_motor_q().tolist()
                 elif args.ee == "dex1" and args.input_mode == "hand":
                     with dual_gripper_data_lock:
                         left_ee_state = [dual_gripper_state_array[0]]
