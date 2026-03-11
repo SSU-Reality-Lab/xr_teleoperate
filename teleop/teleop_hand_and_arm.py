@@ -197,6 +197,7 @@ if __name__ == '__main__':
                                      wrist_view=args.wrist_view,
                                      wrist_webrtc_urls=wrist_webrtc_urls if use_webrtc_relay and args.wrist_view else None,
                                      debug=args.debug,
+                                     waist_follow=args.waist_follow,
                                      )
         
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)

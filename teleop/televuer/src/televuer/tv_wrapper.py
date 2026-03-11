@@ -197,7 +197,7 @@ class TeleVuerWrapper:
                        display_mode: Literal["immersive", "pass-through", "ego"]="immersive", zmq: bool=False, webrtc: bool=False, webrtc_url: str=None,
                        cert_file: str=None, key_file: str=None, return_hand_rot_data: bool=False,
                        wrist_view: bool=False, wrist_webrtc_urls: dict=None,
-                       debug: bool=False):
+                       debug: bool=False, waist_follow: bool=False):
         """
         TeleVuerWrapper is a wrapper for the TeleVuer class, which handles XR device's data suit for robot control.
         It initializes the TeleVuer instance with the specified parameters and provides a method to get motion state data.
@@ -239,6 +239,7 @@ class TeleVuerWrapper:
         """
         self.use_hand_tracking = use_hand_tracking
         self.return_hand_rot_data = return_hand_rot_data
+        self.waist_follow = waist_follow
         self.tvuer = TeleVuer(use_hand_tracking=use_hand_tracking, binocular=binocular, img_shape=img_shape, display_fps=display_fps,
                               display_mode=display_mode, zmq=zmq, webrtc=webrtc, webrtc_url=webrtc_url,
                               cert_file=cert_file, key_file=key_file,
@@ -296,15 +297,29 @@ class TeleVuerWrapper:
             left_IPunitree_Brobot_world_arm = left_IPxr_Brobot_world_arm @ (T_TO_UNITREE_HUMANOID_LEFT_ARM if left_arm_is_valid else np.eye(4))
             right_IPunitree_Brobot_world_arm = right_IPxr_Brobot_world_arm @ (T_TO_UNITREE_HUMANOID_RIGHT_ARM if right_arm_is_valid else np.eye(4))
 
-            # Transfer from WORLD to HEAD coordinate (translation adjustment only)
-            left_IPunitree_Brobot_head_arm = left_IPunitree_Brobot_world_arm.copy()
-            right_IPunitree_Brobot_head_arm = right_IPunitree_Brobot_world_arm.copy()
-            left_IPunitree_Brobot_head_arm[0:3, 3]  = left_IPunitree_Brobot_head_arm[0:3, 3] - Brobot_world_head[0:3, 3]
-            right_IPunitree_Brobot_head_arm[0:3, 3] = right_IPunitree_Brobot_world_arm[0:3, 3] - Brobot_world_head[0:3, 3]
+            # Transfer from WORLD to HEAD coordinate
+            if self.waist_follow:
+                # Yaw-only rotation + translation: the waist motor only follows head yaw,
+                # so pitch/roll of the head should not affect the arm IK targets.
+                head_yaw = np.arctan2(Brobot_world_head[1, 0], Brobot_world_head[0, 0])
+                cos_y, sin_y = np.cos(head_yaw), np.sin(head_yaw)
+                T_head_yaw = np.eye(4)
+                T_head_yaw[0, 0] = cos_y;  T_head_yaw[0, 1] = -sin_y
+                T_head_yaw[1, 0] = sin_y;  T_head_yaw[1, 1] = cos_y
+                T_head_yaw[:3, 3] = Brobot_world_head[:3, 3]
+                T_head_yaw_inv = fast_mat_inv(T_head_yaw)
+                left_IPunitree_Brobot_head_arm  = T_head_yaw_inv @ left_IPunitree_Brobot_world_arm
+                right_IPunitree_Brobot_head_arm = T_head_yaw_inv @ right_IPunitree_Brobot_world_arm
+            else:
+                # Translation adjustment only (waist is fixed, no yaw compensation needed)
+                left_IPunitree_Brobot_head_arm = left_IPunitree_Brobot_world_arm.copy()
+                right_IPunitree_Brobot_head_arm = right_IPunitree_Brobot_world_arm.copy()
+                left_IPunitree_Brobot_head_arm[0:3, 3]  -= Brobot_world_head[0:3, 3]
+                right_IPunitree_Brobot_head_arm[0:3, 3] -= Brobot_world_head[0:3, 3]
 
             # =====coordinate origin offset=====
             # The origin of the coordinate for IK Solve is near the WAIST joint motor. You can use teleop/robot_control/robot_arm_ik.py Unit_Test to visualize it.
-            # The origin of the coordinate of IPunitree_Brobot_head_arm is HEAD. 
+            # The origin of the coordinate of IPunitree_Brobot_head_arm is HEAD.
             # So it is necessary to translate the origin of IPunitree_Brobot_head_arm from HEAD to WAIST.
             left_IPunitree_Brobot_wrist_arm = left_IPunitree_Brobot_head_arm.copy()
             right_IPunitree_Brobot_wrist_arm = right_IPunitree_Brobot_head_arm.copy()
@@ -397,15 +412,26 @@ class TeleVuerWrapper:
             left_IPunitree_Brobot_world_arm  = T_ROBOT_OPENXR @ left_IPunitree_Bxr_world_arm @ T_OPENXR_ROBOT
             right_IPunitree_Brobot_world_arm = T_ROBOT_OPENXR @ right_IPunitree_Bxr_world_arm @ T_OPENXR_ROBOT
 
-            # Transfer from WORLD to HEAD coordinate (translation adjustment only)
-            left_IPunitree_Brobot_head_arm = left_IPunitree_Brobot_world_arm.copy()
-            right_IPunitree_Brobot_head_arm = right_IPunitree_Brobot_world_arm.copy()
-            left_IPunitree_Brobot_head_arm[0:3, 3]  = left_IPunitree_Brobot_head_arm[0:3, 3] - Brobot_world_head[0:3, 3]
-            right_IPunitree_Brobot_head_arm[0:3, 3] = right_IPunitree_Brobot_head_arm[0:3, 3] - Brobot_world_head[0:3, 3]
+            # Transfer from WORLD to HEAD coordinate
+            if self.waist_follow:
+                head_yaw = np.arctan2(Brobot_world_head[1, 0], Brobot_world_head[0, 0])
+                cos_y, sin_y = np.cos(head_yaw), np.sin(head_yaw)
+                T_head_yaw = np.eye(4)
+                T_head_yaw[0, 0] = cos_y;  T_head_yaw[0, 1] = -sin_y
+                T_head_yaw[1, 0] = sin_y;  T_head_yaw[1, 1] = cos_y
+                T_head_yaw[:3, 3] = Brobot_world_head[:3, 3]
+                T_head_yaw_inv = fast_mat_inv(T_head_yaw)
+                left_IPunitree_Brobot_head_arm  = T_head_yaw_inv @ left_IPunitree_Brobot_world_arm
+                right_IPunitree_Brobot_head_arm = T_head_yaw_inv @ right_IPunitree_Brobot_world_arm
+            else:
+                left_IPunitree_Brobot_head_arm = left_IPunitree_Brobot_world_arm.copy()
+                right_IPunitree_Brobot_head_arm = right_IPunitree_Brobot_world_arm.copy()
+                left_IPunitree_Brobot_head_arm[0:3, 3]  -= Brobot_world_head[0:3, 3]
+                right_IPunitree_Brobot_head_arm[0:3, 3] -= Brobot_world_head[0:3, 3]
 
             # =====coordinate origin offset=====
             # The origin of the coordinate for IK Solve is near the WAIST joint motor. You can use teleop/robot_control/robot_arm_ik.py Unit_Test to check it.
-            # The origin of the coordinate of IPunitree_Brobot_head_arm is HEAD. 
+            # The origin of the coordinate of IPunitree_Brobot_head_arm is HEAD.
             # So it is necessary to translate the origin of IPunitree_Brobot_head_arm from HEAD to WAIST.
             left_IPunitree_Brobot_wrist_arm = left_IPunitree_Brobot_head_arm.copy()
             right_IPunitree_Brobot_wrist_arm = right_IPunitree_Brobot_head_arm.copy()
@@ -413,8 +439,6 @@ class TeleVuerWrapper:
             right_IPunitree_Brobot_wrist_arm[0,3] +=0.15
             left_IPunitree_Brobot_wrist_arm[2, 3] +=0.45 # z
             right_IPunitree_Brobot_wrist_arm[2,3] +=0.45
-            # left_IPunitree_Brobot_waist_arm[1, 3] +=0.02 # y
-            # right_IPunitree_Brobot_waist_arm[1,3] +=0.02
             return TeleData(
                 head_pose=Brobot_world_head,
                 left_wrist_pose=left_IPunitree_Brobot_wrist_arm,
