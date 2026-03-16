@@ -28,12 +28,6 @@ from sshkeyboard import listen_keyboard, stop_listening
 from teleop.utils.scene_client import SceneClient
 
 # for simulation
-from unitree_sdk2py.core.channel import ChannelPublisher
-from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
-def publish_reset_category(category: int, publisher): # Scene Reset signal
-    msg = String_(data=str(category))
-    publisher.Write(msg)
-    logger_mp.info(f"published reset category: {category}")
 
 # ---------------------------------------------------------------------------
 # Scene API client (HTTP → FastAPI scene_server on Isaac Lab side)
@@ -340,8 +334,6 @@ if __name__ == '__main__':
 
         # simulation mode
         if args.sim:
-            reset_pose_publisher = ChannelPublisher("rt/reset_pose/cmd", String_)
-            reset_pose_publisher.Init()
             from teleop.utils.sim_state_topic import start_sim_state_subscribe
             sim_state_subscriber = start_sim_state_subscribe()
 
@@ -501,7 +493,6 @@ if __name__ == '__main__':
                 if not RECORD_RUNNING:
                     # === transition in: home (zero) → user joint values ===
                     if args.sim:
-                        publish_reset_category(1, reset_pose_publisher)
                         scene_api_reset(args.scene_api_url)
                         logger_mp.info("⏳  Waiting 3s for scene reset to settle (non-blocking)...")
                         SCENE_RESET_WAIT = True
@@ -656,14 +647,12 @@ if __name__ == '__main__':
                         recorder.save_episode()
                         logger_mp.info("💾  Episode saved. Loading next scene...")
                         if args.sim:
-                            publish_reset_category(1, reset_pose_publisher)
                             scene_api_next(args.scene_api_url)
                     elif finishing_dir == 'out_discard':
                         RECORD_RUNNING = False
                         recorder.discard_episode()
                         logger_mp.info("🗑️  Episode discarded.")
                         if args.sim:
-                            publish_reset_category(1, reset_pose_publisher)
                             scene_api_reset(args.scene_api_url)
                         logger_mp.info("🗑️  Press [s] to start a new recording.")
             else:
