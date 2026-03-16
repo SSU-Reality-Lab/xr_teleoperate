@@ -64,11 +64,18 @@ class EpisodeWriter():
     def is_ready(self):
         return self.is_available
 
+    def set_scene_info(self, task_id: str, instructions: dict):
+        """Update scene metadata (task_id and instructions) for the next episode."""
+        self._scene_task_id = task_id
+        self._scene_instructions = instructions
+
     def data_info(self, version='1.0.0', date=None, author=None):
         self.info = {
-                "version": "1.0.0" if version is None else version, 
+                "version": "1.0.0" if version is None else version,
                 "date": datetime.date.today().strftime('%Y-%m-%d') if date is None else date,
                 "author": "unitree" if author is None else author,
+                "task": getattr(self, '_scene_task_id', ""),
+                "instruction": getattr(self, '_scene_instructions', {}),
                 "image": {"width":self.image_size[0], "height":self.image_size[1], "fps":self.frequency},
                 "depth": {"width":self.image_size[0], "height":self.image_size[1], "fps":self.frequency},
                 "audio": {"sample_rate": 16000, "channels": 1, "format":"PCM", "bits":16},    # PCM_S16
@@ -83,7 +90,7 @@ class EpisodeWriter():
                 "tactile_names": {
                     "left_ee": [],
                     "right_ee": [],
-                }, 
+                },
                 "sim_state": ""
             }
 
@@ -113,6 +120,7 @@ class EpisodeWriter():
         os.makedirs(self.color_dir, exist_ok=True)
         os.makedirs(self.depth_dir, exist_ok=True)
         os.makedirs(self.audio_dir, exist_ok=True)
+        self.data_info()  # Refresh info with latest scene metadata
         with open(self.json_path, "w", encoding="utf-8") as f:
             f.write('{\n')
             f.write('"info": ' + json.dumps(self.info, ensure_ascii=False, indent=4) + ',\n')

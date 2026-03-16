@@ -354,8 +354,11 @@ if __name__ == '__main__':
                                      task_goal = args.task_goal,
                                      task_desc = args.task_desc,
                                      task_steps = args.task_steps,
-                                     frequency = args.frequency, 
+                                     frequency = args.frequency,
                                      rerun_log = not args.headless)
+            # Set initial scene info from Scene API
+            if scene_client is not None:
+                recorder.set_scene_info(status.task_id, status.instructions or {})
 
         logger_mp.info("----------------------------------------------------------------")
         logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
@@ -647,7 +650,12 @@ if __name__ == '__main__':
                         recorder.save_episode()
                         logger_mp.info("💾  Episode saved. Loading next scene...")
                         if args.sim:
-                            scene_api_next(args.scene_api_url)
+                            resp = scene_api_next(args.scene_api_url)
+                            if resp and scene_client is not None:
+                                recorder.set_scene_info(
+                                    resp.get("task_id", ""),
+                                    resp.get("instructions", {}),
+                                )
                     elif finishing_dir == 'out_discard':
                         RECORD_RUNNING = False
                         recorder.discard_episode()

@@ -38,6 +38,8 @@ class SceneResponse:
     task_num: int
     current_scene_index: int
     all_completed: bool
+    task_id: str = ""
+    instructions: dict = None
 
 
 @dataclass
@@ -49,6 +51,8 @@ class SceneStatus:
     scene_json_path: str
     all_completed: bool
     state: str  # "ready", "busy", "finished"
+    task_id: str = ""
+    instructions: dict = None
 
 
 class SceneClient:
@@ -102,6 +106,8 @@ class SceneClient:
                 scene_json_path=data["scene_json_path"],
                 all_completed=data["all_completed"],
                 state=data["state"],
+                task_id=data.get("task_id", ""),
+                instructions=data.get("instructions", {}),
             )
         except requests.RequestException as e:
             logger.error(f"Failed to get scene status: {e}")
@@ -140,6 +146,8 @@ class SceneClient:
                     task_num=data["task_num"],
                     current_scene_index=data["current_scene_index"],
                     all_completed=data["all_completed"],
+                    task_id=data.get("task_id", ""),
+                    instructions=data.get("instructions", {}),
                 )
                 if result.success:
                     logger.info(f"[SceneClient] {endpoint}: {result.message}")
