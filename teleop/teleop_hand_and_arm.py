@@ -34,6 +34,36 @@ def publish_reset_category(category: int, publisher): # Scene Reset signal
     publisher.Write(msg)
     logger_mp.info(f"published reset category: {category}")
 
+# ---------------------------------------------------------------------------
+# Scene API client (HTTP → FastAPI scene_server on Isaac Lab side)
+# ---------------------------------------------------------------------------
+import urllib.request
+import json as _json
+
+def scene_api_reset(base_url: str = "http://localhost:8200"):
+    """POST /scene/reset — reset current scene objects to initial positions."""
+    req = urllib.request.Request(f"{base_url}/scene/reset", method="POST", data=b"")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = _json.loads(resp.read())
+            logger_mp.info(f"POST /scene/reset → {body.get('message', resp.status)}")
+            return body
+    except Exception as e:
+        logger_mp.error(f"scene_api_reset failed: {e}")
+        return None
+
+def scene_api_next(base_url: str = "http://localhost:8200"):
+    """POST /scene/next — load the next scene."""
+    req = urllib.request.Request(f"{base_url}/scene/next", method="POST", data=b"")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = _json.loads(resp.read())
+            logger_mp.info(f"POST /scene/next → {body.get('message', resp.status)}")
+            return body
+    except Exception as e:
+        logger_mp.error(f"scene_api_next failed: {e}")
+        return None
+
 def extract_yaw_from_pose(pose_4x4: np.ndarray) -> float:
     """Extract yaw angle (z-up convention) from a 4x4 pose matrix."""
     return float(np.arctan2(pose_4x4[1, 0], pose_4x4[0, 0]))
@@ -47,6 +77,12 @@ READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNI
 RECORD_RUNNING = False  # True if [Recording]
 RECORD_TOGGLE  = False  # Toggle recording state
 RECORD_DISCARD = False  # Discard current recording
+TRANSITION_ACTIVE = False  # True during transition-in or transition-out
+TRANSITION_DIR    = None   # 'in', 'out_save', 'out_discard' — non-blocking transition direction
+transition_start_time = 0.0
+SCENE_RESET_WAIT  = False  # True during non-blocking scene reset wait (holding zero pose)
+scene_reset_start_time = 0.0
+SCENE_RESET_WAIT_SEC = 3.0
 #  -------        ---------                -----------                -----------            ---------
 #   state          [Ready]      ==>        [Recording]     ==>         [AutoSave]     -->     [Ready]
 #  -------        ---------      |         -----------      |         -----------      |     ---------
@@ -63,7 +99,7 @@ def on_press(key):
     global STOP, START, RECORD_TOGGLE, RECORD_DISCARD, SOFT_ESTOP, arm_ctrl_ref
     if key == 'r':
         START = True
-    elif key in ('q', 'space'):
+    elif key in 'q':
         START = False
         STOP = True
     elif key in ('up', 'down', 'left', 'right'):
@@ -79,10 +115,13 @@ def on_press(key):
             arm_ctrl_ref.msg.motor_cmd[G1_29_JointIndex.kWaistYaw].kp = 0.0
             arm_ctrl_ref.msg.motor_cmd[G1_29_JointIndex.kWaistYaw].kd = 0.0
         logger_mp.info(f"🛑  [SOFT E-STOP] '{key}' pressed! Arms entering damping mode...")
-    elif key == 's' and START == True:
+    elif key in ('s', 'space') and START == True and not TRANSITION_ACTIVE:
         RECORD_TOGGLE = True
-    elif key == 'd' and START == True and RECORD_RUNNING == True:
+    elif key == 'g' and START == True and RECORD_RUNNING == True and not TRANSITION_ACTIVE:
         RECORD_DISCARD = True
+    elif key != 'space' and START == True and RECORD_RUNNING == True and not TRANSITION_ACTIVE:
+        RECORD_DISCARD = True
+        logger_mp.info(f"🗑️  [on_press] '{key}' pressed → discarding current episode.")
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
 
@@ -128,6 +167,10 @@ if __name__ == '__main__':
     parser.add_argument('--waist-max-deg', type=float, default=35.0, help='Max waist rotation in degrees')
     parser.add_argument('--waist-smoothing', type=float, default=0.15, help='Low-pass filter factor (0~1, lower=smoother)')
     parser.add_argument('--waist-deadband-deg', type=float, default=3.0, help='Deadband threshold in degrees')
+    # transition options for record mode
+    parser.add_argument('--transition-time', type=float, default=2.0, help='Time (seconds) for gradual joint transition at recording start/end')
+    # scene API (sim mode only)
+    parser.add_argument('--scene-api-url', type=str, default='http://reality1.local:8200', help='Base URL of the scene control API server (Isaac Lab side)')
 
     args = parser.parse_args()
     if args.sim and not args.wrist_view:
@@ -313,7 +356,7 @@ if __name__ == '__main__':
         logger_mp.info("----------------------------------------------------------------")
         logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
         if args.record:
-            logger_mp.info("🟡  Press [s] to START or SAVE recording (toggle cycle).")
+            logger_mp.info(f"🟡  Press [s] to START or SAVE recording (with {args.transition_time}s transition).")
             logger_mp.info("🗑️   Press [d] to DISCARD current recording (during recording).")
         else:
             logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
@@ -411,25 +454,75 @@ if __name__ == '__main__':
             # record mode: discard
             if args.record and RECORD_DISCARD:
                 RECORD_DISCARD = False
-                RECORD_RUNNING = False
-                recorder.discard_episode()
-                logger_mp.info("🗑️  Episode discarded. Press [s] to start a new recording.")
-                if args.sim:
-                    publish_reset_category(1, reset_pose_publisher)
+                logger_mp.info("🗑️  Episode discarded. Transitioning to home position...")
+                TRANSITION_ACTIVE = True
+                TRANSITION_DIR = 'out_discard'
+                transition_start_time = time.time()
+                q_home = np.zeros(14)
+                tauff_home = np.zeros(14)
 
             # record mode: toggle (start / save)
+            # non-blocking scene reset wait: hold zero pose until settled
+            if SCENE_RESET_WAIT:
+                elapsed_wait = time.time() - scene_reset_start_time
+                q_home = np.zeros(14)
+                tauff_home = np.zeros(14)
+                arm_ctrl.ctrl_dual_arm(q_home, tauff_home)
+                if args.waist_follow:
+                    with arm_ctrl.ctrl_lock:
+                        arm_ctrl.msg.motor_cmd[waist_yaw_index].q = 0.0
+                if elapsed_wait >= SCENE_RESET_WAIT_SEC:
+                    SCENE_RESET_WAIT = False
+                    logger_mp.info("🔄  Scene reset done. Creating episode before transition...")
+                    if not recorder.create_episode():
+                        logger_mp.error("Failed to create episode. Recording not started.")
+                        continue
+                    RECORD_RUNNING = True
+                    TRANSITION_ACTIVE = True
+                    TRANSITION_DIR = 'in'
+                    transition_start_time = time.time()
+                    logger_mp.info("✅  Transition-in started.")
+                continue
+
             if args.record and RECORD_TOGGLE:
                 RECORD_TOGGLE = False
                 if not RECORD_RUNNING:
-                    if recorder.create_episode():
-                        RECORD_RUNNING = True
-                    else:
-                        logger_mp.error("Failed to create episode. Recording not started.")
-                else:
-                    RECORD_RUNNING = False
-                    recorder.save_episode()
+                    # === transition in: home (zero) → user joint values ===
                     if args.sim:
                         publish_reset_category(1, reset_pose_publisher)
+                        scene_api_reset(args.scene_api_url)
+                        logger_mp.info("⏳  Waiting 3s for scene reset to settle (non-blocking)...")
+                        SCENE_RESET_WAIT = True
+                        scene_reset_start_time = time.time()
+                        q_home = np.zeros(14)
+                        tauff_home = np.zeros(14)
+                        arm_ctrl.ctrl_dual_arm(q_home, tauff_home)
+                        if args.waist_follow:
+                            with arm_ctrl.ctrl_lock:
+                                arm_ctrl.msg.motor_cmd[waist_yaw_index].q = 0.0
+                    else:
+                        # no sim: start transition immediately
+                        if not recorder.create_episode():
+                            logger_mp.error("Failed to create episode. Recording not started.")
+                            continue
+                        RECORD_RUNNING = True
+                        TRANSITION_ACTIVE = True
+                        TRANSITION_DIR = 'in'
+                        transition_start_time = time.time()
+                        q_home = np.zeros(14)
+                        tauff_home = np.zeros(14)
+                        arm_ctrl.ctrl_dual_arm(q_home, tauff_home)
+                        if args.waist_follow:
+                            with arm_ctrl.ctrl_lock:
+                                arm_ctrl.msg.motor_cmd[waist_yaw_index].q = 0.0
+                else:
+                    # === transition out: user joint values → home (zero) ===
+                    logger_mp.info("💾  Transitioning to home position (still recording)...")
+                    TRANSITION_ACTIVE = True
+                    TRANSITION_DIR = 'out_save'
+                    transition_start_time = time.time()
+                    q_home = np.zeros(14)
+                    tauff_home = np.zeros(14)
 
             # get xr's tele data
             tele_data = tv_wrapper.get_tele_data()
@@ -489,10 +582,12 @@ if __name__ == '__main__':
                 waist_cmd_q = (1.0 - args.waist_smoothing) * waist_cmd_q + args.waist_smoothing * waist_target_q
 
                 # write directly to motor_cmd (thread-safe)
-                with arm_ctrl.ctrl_lock:
-                    arm_ctrl.msg.motor_cmd[waist_yaw_index].q = waist_cmd_q
-                    arm_ctrl.msg.motor_cmd[waist_yaw_index].dq = 0.0
-                    arm_ctrl.msg.motor_cmd[waist_yaw_index].tau = 0.0
+                # skip during transition — transition blending handles waist motor_cmd
+                if TRANSITION_DIR is None:
+                    with arm_ctrl.ctrl_lock:
+                        arm_ctrl.msg.motor_cmd[waist_yaw_index].q = waist_cmd_q
+                        arm_ctrl.msg.motor_cmd[waist_yaw_index].dq = 0.0
+                        arm_ctrl.msg.motor_cmd[waist_yaw_index].tau = 0.0
 
             # get current robot state data.
             current_lr_arm_q  = arm_ctrl.get_current_dual_arm_q()
@@ -503,7 +598,64 @@ if __name__ == '__main__':
             sol_q, sol_tauff  = arm_ik.solve_ik(tele_data.left_wrist_pose, tele_data.right_wrist_pose, current_lr_arm_q, current_lr_arm_dq)
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
-            arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
+
+            # --- non-blocking transition blending ---
+            if TRANSITION_DIR == 'in':
+                elapsed = time.time() - transition_start_time
+                alpha = min(1.0, elapsed / args.transition_time)
+                sol_q = (1.0 - alpha) * q_home + alpha * sol_q
+                sol_tauff = (1.0 - alpha) * tauff_home + alpha * sol_tauff
+                arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
+                if args.waist_follow:
+                    waist_blended = (1.0 - alpha) * 0.0 + alpha * waist_cmd_q
+                    with arm_ctrl.ctrl_lock:
+                        arm_ctrl.msg.motor_cmd[waist_yaw_index].q = waist_blended
+                        arm_ctrl.msg.motor_cmd[waist_yaw_index].dq = 0.0
+                        arm_ctrl.msg.motor_cmd[waist_yaw_index].tau = 0.0
+                if alpha >= 1.0:
+                    TRANSITION_DIR = None
+                    TRANSITION_ACTIVE = False
+                    logger_mp.info("✅  Transition complete. Recording in progress...")
+            elif TRANSITION_DIR in ('out_save', 'out_discard'):
+                elapsed = time.time() - transition_start_time
+                alpha = max(0.0, 1.0 - elapsed / args.transition_time)
+                sol_q = (1.0 - alpha) * q_home + alpha * sol_q
+                sol_tauff = (1.0 - alpha) * tauff_home + alpha * sol_tauff
+                arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
+                if args.waist_follow:
+                    waist_blended = (1.0 - alpha) * 0.0 + alpha * waist_cmd_q
+                    with arm_ctrl.ctrl_lock:
+                        arm_ctrl.msg.motor_cmd[waist_yaw_index].q = waist_blended
+                        arm_ctrl.msg.motor_cmd[waist_yaw_index].dq = 0.0
+                        arm_ctrl.msg.motor_cmd[waist_yaw_index].tau = 0.0
+                if alpha <= 0.0:
+                    arm_ctrl.ctrl_dual_arm(q_home, tauff_home)
+                    if args.waist_follow:
+                        with arm_ctrl.ctrl_lock:
+                            arm_ctrl.msg.motor_cmd[waist_yaw_index].q = 0.0
+                        waist_cmd_q = 0.0
+                        waist_base_q = 0.0
+                        waist_head_yaw_ref = None
+                    finishing_dir = TRANSITION_DIR
+                    TRANSITION_DIR = None
+                    TRANSITION_ACTIVE = False
+                    if finishing_dir == 'out_save':
+                        RECORD_RUNNING = False
+                        recorder.save_episode()
+                        logger_mp.info("💾  Episode saved. Loading next scene...")
+                        if args.sim:
+                            publish_reset_category(1, reset_pose_publisher)
+                            scene_api_next(args.scene_api_url)
+                    elif finishing_dir == 'out_discard':
+                        RECORD_RUNNING = False
+                        recorder.discard_episode()
+                        logger_mp.info("🗑️  Episode discarded.")
+                        if args.sim:
+                            publish_reset_category(1, reset_pose_publisher)
+                            scene_api_reset(args.scene_api_url)
+                        logger_mp.info("🗑️  Press [s] to start a new recording.")
+            else:
+                arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
 
             # record data
             if args.record:
