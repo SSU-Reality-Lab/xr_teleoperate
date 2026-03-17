@@ -73,7 +73,7 @@ RECORD_RUNNING = False  # True if [Recording]
 RECORD_TOGGLE  = False  # Toggle recording state
 RECORD_DISCARD = False  # Discard current recording
 TRANSITION_ACTIVE = False  # True during transition-in or transition-out
-TRANSITION_DIR    = None   # 'in', 'out_save', 'out_discard' — non-blocking transition direction
+TRANSITION_DIR    = None   # 'in' — non-blocking transition-in direction (transition-out removed)
 transition_start_time = 0.0
 SCENE_RESET_WAIT  = False  # True during non-blocking scene reset wait (holding zero pose)
 scene_reset_start_time = 0.0
@@ -274,8 +274,10 @@ if __name__ == '__main__':
             dual_hand_data_lock = Lock()
             dual_hand_state_array = Array('d', 14, lock = False)   # [output] current left, right hand state(14) data.
             dual_hand_action_array = Array('d', 14, lock = False)  # [output] current left, right hand action(14) data.
-            hand_ctrl = Dex3_1_Controller(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, 
-                                          dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim)
+            hand_transition_alpha = Value('d', 1.0, lock=True)  # 0.0=home, 1.0=user control
+            hand_ctrl = Dex3_1_Controller(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock,
+                                          dual_hand_state_array, dual_hand_action_array,
+                                          hand_transition_alpha=hand_transition_alpha, simulation_mode=args.sim)
         elif args.ee == "dex1":
             from teleop.robot_control.robot_hand_unitree import Dex1_1_Gripper_Controller
             left_gripper_value = Value('d', 0.0, lock=True)        # [input]
@@ -461,21 +463,25 @@ if __name__ == '__main__':
             # record mode: discard
             if args.record and RECORD_DISCARD:
                 RECORD_DISCARD = False
-                # Immediately discard episode BEFORE transition so go-home movement is not recorded
                 RECORD_RUNNING = False
                 recorder.discard_episode()
-                logger_mp.info("🗑️  Episode discarded. Transitioning to home position...")
-                TRANSITION_ACTIVE = True
-                TRANSITION_DIR = 'out_discard'
-                transition_start_time = time.time()
-                q_home = np.zeros(14)
-                tauff_home = np.zeros(14)
-                # Signal gripper go-home via sentinel in input arrays
+                logger_mp.info("🗑️  Episode discarded.")
+                # Immediately set arm and hand to home (no transition-out blending)
+                arm_ctrl.ctrl_dual_arm(np.zeros(14), np.zeros(14))
+                if args.waist_follow:
+                    with arm_ctrl.ctrl_lock:
+                        arm_ctrl.msg.motor_cmd[waist_yaw_index].q = 0.0
+                    waist_cmd_q = 0.0
+                    waist_base_q = 0.0
+                    waist_head_yaw_ref = None
                 if args.ee == "dex3":
                     with left_hand_pos_array.get_lock():
                         left_hand_pos_array[:] = [DEX3_GO_HOME_SENTINEL] * 75
                     with right_hand_pos_array.get_lock():
                         right_hand_pos_array[:] = [DEX3_GO_HOME_SENTINEL] * 75
+                if args.sim:
+                    scene_api_reset(args.scene_api_url)
+                logger_mp.info("🗑️  Press [s] to start a new recording.")
 
             # record mode: toggle (start / save)
             # non-blocking scene reset wait: hold zero pose until settled
@@ -497,6 +503,9 @@ if __name__ == '__main__':
                     TRANSITION_ACTIVE = True
                     TRANSITION_DIR = 'in'
                     transition_start_time = time.time()
+                    # Start hand transition-in blending from home (alpha=0 → 1)
+                    if args.ee == "dex3":
+                        hand_transition_alpha.value = 0.0
                     logger_mp.info("✅  Transition-in started.")
                 continue
 
@@ -515,6 +524,12 @@ if __name__ == '__main__':
                         if args.waist_follow:
                             with arm_ctrl.ctrl_lock:
                                 arm_ctrl.msg.motor_cmd[waist_yaw_index].q = 0.0
+                        # Signal dex3 hand go-home so hand resets to default open pose
+                        if args.ee == "dex3":
+                            with left_hand_pos_array.get_lock():
+                                left_hand_pos_array[:] = [DEX3_GO_HOME_SENTINEL] * 75
+                            with right_hand_pos_array.get_lock():
+                                right_hand_pos_array[:] = [DEX3_GO_HOME_SENTINEL] * 75
                     else:
                         # no sim: start transition immediately
                         if not recorder.create_episode():
@@ -530,28 +545,42 @@ if __name__ == '__main__':
                         if args.waist_follow:
                             with arm_ctrl.ctrl_lock:
                                 arm_ctrl.msg.motor_cmd[waist_yaw_index].q = 0.0
+                        # Start hand transition-in blending from home (alpha=0 → 1)
+                        if args.ee == "dex3":
+                            hand_transition_alpha.value = 0.0
                 else:
-                    # === transition out: user joint values → home (zero) ===
-                    # Immediately save episode BEFORE transition so go-home movement is not recorded
+                    # === save episode and immediately go home (no transition-out) ===
                     RECORD_RUNNING = False
                     recorder.save_episode()
-                    logger_mp.info("💾  Episode saved. Transitioning to home position...")
-                    TRANSITION_ACTIVE = True
-                    TRANSITION_DIR = 'out_save'
-                    transition_start_time = time.time()
-                    q_home = np.zeros(14)
-                    tauff_home = np.zeros(14)
-                    # Signal gripper go-home via sentinel in input arrays
+                    logger_mp.info("💾  Episode saved.")
+                    # Immediately set arm and hand to home
+                    arm_ctrl.ctrl_dual_arm(np.zeros(14), np.zeros(14))
+                    if args.waist_follow:
+                        with arm_ctrl.ctrl_lock:
+                            arm_ctrl.msg.motor_cmd[waist_yaw_index].q = 0.0
+                        waist_cmd_q = 0.0
+                        waist_base_q = 0.0
+                        waist_head_yaw_ref = None
                     if args.ee == "dex3":
                         with left_hand_pos_array.get_lock():
                             left_hand_pos_array[:] = [DEX3_GO_HOME_SENTINEL] * 75
                         with right_hand_pos_array.get_lock():
                             right_hand_pos_array[:] = [DEX3_GO_HOME_SENTINEL] * 75
+                    # Load next scene
+                    logger_mp.info("💾  Loading next scene...")
+                    if args.sim:
+                        resp = scene_api_next(args.scene_api_url)
+                        if resp and scene_client is not None:
+                            recorder.set_scene_info(
+                                resp.get("task_id", ""),
+                                resp.get("instructions", {}),
+                            )
 
             # get xr's tele data
             tele_data = tv_wrapper.get_tele_data()
-            # During transition-out, skip XR hand data to keep go-home sentinel active
-            hand_go_home_active = TRANSITION_DIR in ('out_save', 'out_discard')
+            # During scene reset, skip XR hand data to keep go-home sentinel active
+            # During transition-in, XR data flows and alpha blending is handled in control_process
+            hand_go_home_active = SCENE_RESET_WAIT
             if (args.ee == "dex3" or args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco") and args.input_mode == "hand" and not hand_go_home_active:
                 with left_hand_pos_array.get_lock():
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
@@ -625,7 +654,7 @@ if __name__ == '__main__':
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
 
-            # --- non-blocking transition blending ---
+            # --- non-blocking transition-in blending ---
             if TRANSITION_DIR == 'in':
                 elapsed = time.time() - transition_start_time
                 alpha = min(1.0, elapsed / args.transition_time)
@@ -638,49 +667,13 @@ if __name__ == '__main__':
                         arm_ctrl.msg.motor_cmd[waist_yaw_index].q = waist_blended
                         arm_ctrl.msg.motor_cmd[waist_yaw_index].dq = 0.0
                         arm_ctrl.msg.motor_cmd[waist_yaw_index].tau = 0.0
+                # Update hand transition alpha (control_process blends home_q → retargeted)
+                if args.ee == "dex3":
+                    hand_transition_alpha.value = alpha
                 if alpha >= 1.0:
                     TRANSITION_DIR = None
                     TRANSITION_ACTIVE = False
                     logger_mp.info("✅  Transition complete. Recording in progress...")
-            elif TRANSITION_DIR in ('out_save', 'out_discard'):
-                elapsed = time.time() - transition_start_time
-                alpha = max(0.0, 1.0 - elapsed / args.transition_time)
-                sol_q = (1.0 - alpha) * q_home + alpha * sol_q
-                sol_tauff = (1.0 - alpha) * tauff_home + alpha * sol_tauff
-                arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
-                if args.waist_follow:
-                    waist_blended = (1.0 - alpha) * 0.0 + alpha * waist_cmd_q
-                    with arm_ctrl.ctrl_lock:
-                        arm_ctrl.msg.motor_cmd[waist_yaw_index].q = waist_blended
-                        arm_ctrl.msg.motor_cmd[waist_yaw_index].dq = 0.0
-                        arm_ctrl.msg.motor_cmd[waist_yaw_index].tau = 0.0
-                if alpha <= 0.0:
-                    arm_ctrl.ctrl_dual_arm(q_home, tauff_home)
-                    if args.waist_follow:
-                        with arm_ctrl.ctrl_lock:
-                            arm_ctrl.msg.motor_cmd[waist_yaw_index].q = 0.0
-                        waist_cmd_q = 0.0
-                        waist_base_q = 0.0
-                        waist_head_yaw_ref = None
-                    finishing_dir = TRANSITION_DIR
-                    TRANSITION_DIR = None
-                    TRANSITION_ACTIVE = False
-                    # Gripper go-home sentinel is automatically cleared when TRANSITION_DIR=None
-                    # and XR data writing resumes in the next iteration
-                    if finishing_dir == 'out_save':
-                        logger_mp.info("💾  Transition complete. Loading next scene...")
-                        if args.sim:
-                            resp = scene_api_next(args.scene_api_url)
-                            if resp and scene_client is not None:
-                                recorder.set_scene_info(
-                                    resp.get("task_id", ""),
-                                    resp.get("instructions", {}),
-                                )
-                    elif finishing_dir == 'out_discard':
-                        logger_mp.info("🗑️  Transition complete.")
-                        if args.sim:
-                            scene_api_reset(args.scene_api_url)
-                        logger_mp.info("🗑️  Press [s] to start a new recording.")
             else:
                 arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
 

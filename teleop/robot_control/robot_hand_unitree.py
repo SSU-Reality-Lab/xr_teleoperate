@@ -34,7 +34,7 @@ kTopicDex3RightState = "rt/dex3/right/state"
 
 class Dex3_1_Controller:
     def __init__(self, left_hand_array_in, right_hand_array_in, dual_hand_data_lock = None, dual_hand_state_array_out = None,
-                       dual_hand_action_array_out = None, fps = 100.0, Unit_Test = False, simulation_mode = False):
+                       dual_hand_action_array_out = None, hand_transition_alpha = None, fps = 100.0, Unit_Test = False, simulation_mode = False):
         """
         [note] A *_array type parameter requires using a multiprocessing Array, because it needs to be passed to the internal child process
 
@@ -100,9 +100,10 @@ class Dex3_1_Controller:
             self._home_q_array[Dex3_Num_Motors:] = list(self.right_hand_state_array[:])
         logger_mp.info(f"[Dex3_1_Controller] Home position saved: L={list(self._home_q_array[:Dex3_Num_Motors])}, R={list(self._home_q_array[Dex3_Num_Motors:])}")
 
+        self._hand_transition_alpha = hand_transition_alpha
         hand_control_process = Process(target=self.control_process, args=(left_hand_array_in, right_hand_array_in,  self.left_hand_state_array, self.right_hand_state_array,
                                                                           dual_hand_data_lock, dual_hand_state_array_out, dual_hand_action_array_out,
-                                                                          self._home_q_array))
+                                                                          self._home_q_array, self._hand_transition_alpha))
         hand_control_process.daemon = True
         hand_control_process.start()
 
@@ -154,7 +155,7 @@ class Dex3_1_Controller:
     
     def control_process(self, left_hand_array_in, right_hand_array_in, left_hand_state_array, right_hand_state_array,
                               dual_hand_data_lock = None, dual_hand_state_array_out = None, dual_hand_action_array_out = None,
-                              home_q_array = None):
+                              home_q_array = None, hand_transition_alpha = None):
         self.running = True
 
         left_q_target  = np.full(Dex3_Num_Motors, 0)
@@ -222,6 +223,13 @@ class Dex3_1_Controller:
 
                     left_q_target  = self.hand_retargeting.left_retargeting.retarget(ref_left_value)[self.hand_retargeting.right_dex_retargeting_to_hardware]
                     right_q_target = self.hand_retargeting.right_retargeting.retarget(ref_right_value)[self.hand_retargeting.right_dex_retargeting_to_hardware]
+
+                    # Transition-in blending: blend from home_q to retargeted values
+                    if hand_transition_alpha is not None:
+                        alpha = hand_transition_alpha.value
+                        if alpha < 1.0:
+                            left_q_target  = (1.0 - alpha) * home_left_q + alpha * left_q_target
+                            right_q_target = (1.0 - alpha) * home_right_q + alpha * right_q_target
 
                 # get dual hand action
                 action_data = np.concatenate((left_q_target, right_q_target))    
