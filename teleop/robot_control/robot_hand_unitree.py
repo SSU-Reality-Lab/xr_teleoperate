@@ -25,6 +25,7 @@ logger_mp = logging_mp.getLogger(__name__)
 
 
 Dex3_Num_Motors = 7
+DEX3_GO_HOME_SENTINEL = -999.0  # sentinel value written to hand_pos_array to signal go-home
 kTopicDex3LeftCommand = "rt/dex3/left/cmd"
 kTopicDex3RightCommand = "rt/dex3/right/cmd"
 kTopicDex3LeftState = "rt/dex3/left/state"
@@ -75,8 +76,11 @@ class Dex3_1_Controller:
         self.RightHandState_subscriber.Init()
 
         # Shared Arrays for hand states
-        self.left_hand_state_array  = Array('d', Dex3_Num_Motors, lock=True)  
+        self.left_hand_state_array  = Array('d', Dex3_Num_Motors, lock=True)
         self.right_hand_state_array = Array('d', Dex3_Num_Motors, lock=True)
+
+        # Home joint positions (left7 + right7), saved at init before user connects
+        self._home_q_array = Array('d', Dex3_Num_Motors * 2, lock=True)
 
         # initialize subscribe thread
         self.subscribe_state_thread = threading.Thread(target=self._subscribe_hand_state)
@@ -90,12 +94,26 @@ class Dex3_1_Controller:
             logger_mp.warning("[Dex3_1_Controller] Waiting to subscribe dds...")
         logger_mp.info("[Dex3_1_Controller] Subscribe dds ok.")
 
+        # Save initial hand joint state as home position (before user socket connects)
+        with self._home_q_array.get_lock():
+            self._home_q_array[:Dex3_Num_Motors] = list(self.left_hand_state_array[:])
+            self._home_q_array[Dex3_Num_Motors:] = list(self.right_hand_state_array[:])
+        logger_mp.info(f"[Dex3_1_Controller] Home position saved: L={list(self._home_q_array[:Dex3_Num_Motors])}, R={list(self._home_q_array[Dex3_Num_Motors:])}")
+
         hand_control_process = Process(target=self.control_process, args=(left_hand_array_in, right_hand_array_in,  self.left_hand_state_array, self.right_hand_state_array,
-                                                                          dual_hand_data_lock, dual_hand_state_array_out, dual_hand_action_array_out))
+                                                                          dual_hand_data_lock, dual_hand_state_array_out, dual_hand_action_array_out,
+                                                                          self._home_q_array))
         hand_control_process.daemon = True
         hand_control_process.start()
 
         logger_mp.info("Initialize Dex3_1_Controller OK!")
+
+    def get_home_q(self):
+        """Return saved initial (home) joint positions as (left_q[7], right_q[7])."""
+        with self._home_q_array.get_lock():
+            left_q = list(self._home_q_array[:Dex3_Num_Motors])
+            right_q = list(self._home_q_array[Dex3_Num_Motors:])
+        return left_q, right_q
 
     def _subscribe_hand_state(self):
         while True:
@@ -135,11 +153,22 @@ class Dex3_1_Controller:
         # logger_mp.debug("hand ctrl publish ok.")
     
     def control_process(self, left_hand_array_in, right_hand_array_in, left_hand_state_array, right_hand_state_array,
-                              dual_hand_data_lock = None, dual_hand_state_array_out = None, dual_hand_action_array_out = None):
+                              dual_hand_data_lock = None, dual_hand_state_array_out = None, dual_hand_action_array_out = None,
+                              home_q_array = None):
         self.running = True
 
         left_q_target  = np.full(Dex3_Num_Motors, 0)
         right_q_target = np.full(Dex3_Num_Motors, 0)
+
+        # Read home position once at process start (set before fork)
+        if home_q_array is not None:
+            with home_q_array.get_lock():
+                home_left_q = np.array(home_q_array[:Dex3_Num_Motors])
+                home_right_q = np.array(home_q_array[Dex3_Num_Motors:])
+            logger_mp.info(f"[Dex3_1_Controller] control_process home_q loaded: L={home_left_q.tolist()}, R={home_right_q.tolist()}")
+        else:
+            home_left_q = np.zeros(Dex3_Num_Motors)
+            home_right_q = np.zeros(Dex3_Num_Motors)
 
         q = 0.0
         dq = 0.0
@@ -183,7 +212,11 @@ class Dex3_1_Controller:
                 # Read left and right q_state from shared arrays
                 state_data = np.concatenate((np.array(left_hand_state_array[:]), np.array(right_hand_state_array[:])))
 
-                if not np.all(right_hand_data == 0.0) and not np.all(left_hand_data[4] == np.array([-1.13, 0.3, 0.15])): # if hand data has been initialized.
+                # Go-home sentinel: main process writes DEX3_GO_HOME_SENTINEL to input arrays
+                if right_hand_data[0][0] == DEX3_GO_HOME_SENTINEL:
+                    left_q_target = home_left_q.copy()
+                    right_q_target = home_right_q.copy()
+                elif not np.all(right_hand_data == 0.0) and not np.all(left_hand_data[4] == np.array([-1.13, 0.3, 0.15])): # if hand data has been initialized.
                     ref_left_value = left_hand_data[self.hand_retargeting.left_indices[1,:]] - left_hand_data[self.hand_retargeting.left_indices[0,:]]
                     ref_right_value = right_hand_data[self.hand_retargeting.right_indices[1,:]] - right_hand_data[self.hand_retargeting.right_indices[0,:]]
 

@@ -268,7 +268,7 @@ if __name__ == '__main__':
 
         # end-effector
         if args.ee == "dex3":
-            from teleop.robot_control.robot_hand_unitree import Dex3_1_Controller
+            from teleop.robot_control.robot_hand_unitree import Dex3_1_Controller, DEX3_GO_HOME_SENTINEL
             left_hand_pos_array = Array('d', 75, lock = True)      # [input]
             right_hand_pos_array = Array('d', 75, lock = True)     # [input]
             dual_hand_data_lock = Lock()
@@ -461,12 +461,21 @@ if __name__ == '__main__':
             # record mode: discard
             if args.record and RECORD_DISCARD:
                 RECORD_DISCARD = False
+                # Immediately discard episode BEFORE transition so go-home movement is not recorded
+                RECORD_RUNNING = False
+                recorder.discard_episode()
                 logger_mp.info("🗑️  Episode discarded. Transitioning to home position...")
                 TRANSITION_ACTIVE = True
                 TRANSITION_DIR = 'out_discard'
                 transition_start_time = time.time()
                 q_home = np.zeros(14)
                 tauff_home = np.zeros(14)
+                # Signal gripper go-home via sentinel in input arrays
+                if args.ee == "dex3":
+                    with left_hand_pos_array.get_lock():
+                        left_hand_pos_array[:] = [DEX3_GO_HOME_SENTINEL] * 75
+                    with right_hand_pos_array.get_lock():
+                        right_hand_pos_array[:] = [DEX3_GO_HOME_SENTINEL] * 75
 
             # record mode: toggle (start / save)
             # non-blocking scene reset wait: hold zero pose until settled
@@ -523,16 +532,27 @@ if __name__ == '__main__':
                                 arm_ctrl.msg.motor_cmd[waist_yaw_index].q = 0.0
                 else:
                     # === transition out: user joint values → home (zero) ===
-                    logger_mp.info("💾  Transitioning to home position (still recording)...")
+                    # Immediately save episode BEFORE transition so go-home movement is not recorded
+                    RECORD_RUNNING = False
+                    recorder.save_episode()
+                    logger_mp.info("💾  Episode saved. Transitioning to home position...")
                     TRANSITION_ACTIVE = True
                     TRANSITION_DIR = 'out_save'
                     transition_start_time = time.time()
                     q_home = np.zeros(14)
                     tauff_home = np.zeros(14)
+                    # Signal gripper go-home via sentinel in input arrays
+                    if args.ee == "dex3":
+                        with left_hand_pos_array.get_lock():
+                            left_hand_pos_array[:] = [DEX3_GO_HOME_SENTINEL] * 75
+                        with right_hand_pos_array.get_lock():
+                            right_hand_pos_array[:] = [DEX3_GO_HOME_SENTINEL] * 75
 
             # get xr's tele data
             tele_data = tv_wrapper.get_tele_data()
-            if (args.ee == "dex3" or args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco") and args.input_mode == "hand":
+            # During transition-out, skip XR hand data to keep go-home sentinel active
+            hand_go_home_active = TRANSITION_DIR in ('out_save', 'out_discard')
+            if (args.ee == "dex3" or args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco") and args.input_mode == "hand" and not hand_go_home_active:
                 with left_hand_pos_array.get_lock():
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
                 with right_hand_pos_array.get_lock():
@@ -645,10 +665,10 @@ if __name__ == '__main__':
                     finishing_dir = TRANSITION_DIR
                     TRANSITION_DIR = None
                     TRANSITION_ACTIVE = False
+                    # Gripper go-home sentinel is automatically cleared when TRANSITION_DIR=None
+                    # and XR data writing resumes in the next iteration
                     if finishing_dir == 'out_save':
-                        RECORD_RUNNING = False
-                        recorder.save_episode()
-                        logger_mp.info("💾  Episode saved. Loading next scene...")
+                        logger_mp.info("💾  Transition complete. Loading next scene...")
                         if args.sim:
                             resp = scene_api_next(args.scene_api_url)
                             if resp and scene_client is not None:
@@ -657,9 +677,7 @@ if __name__ == '__main__':
                                     resp.get("instructions", {}),
                                 )
                     elif finishing_dir == 'out_discard':
-                        RECORD_RUNNING = False
-                        recorder.discard_episode()
-                        logger_mp.info("🗑️  Episode discarded.")
+                        logger_mp.info("🗑️  Transition complete.")
                         if args.sim:
                             scene_api_reset(args.scene_api_url)
                         logger_mp.info("🗑️  Press [s] to start a new recording.")
@@ -819,6 +837,26 @@ if __name__ == '__main__':
         import traceback
         logger_mp.error(traceback.format_exc())
     finally:
+        # Auto-save episode if still recording on quit
+        if args.record and RECORD_RUNNING:
+            try:
+                RECORD_RUNNING = False
+                recorder.save_episode()
+                logger_mp.info("💾  Auto-saved episode on exit.")
+            except Exception as e:
+                logger_mp.error(f"Failed to auto-save episode on exit: {e}")
+
+        # Signal gripper to return to initial position via sentinel
+        try:
+            if args.ee == "dex3":
+                with left_hand_pos_array.get_lock():
+                    left_hand_pos_array[:] = [DEX3_GO_HOME_SENTINEL] * 75
+                with right_hand_pos_array.get_lock():
+                    right_hand_pos_array[:] = [DEX3_GO_HOME_SENTINEL] * 75
+                logger_mp.info("[Dex3] Gripper go-home sentinel set.")
+        except Exception as e:
+            logger_mp.error(f"Failed to set hand go_home sentinel: {e}")
+
         try:
             arm_ctrl.ctrl_dual_arm_go_home()
         except Exception as e:
